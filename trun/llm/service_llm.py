@@ -19,9 +19,14 @@ class ServiceLLM:
     - Other system automation tasks
 
     Configuration is read from environment variables:
-    - TRUN_LLM_PROVIDER: LLM provider (default: openai)
+    - TRUN_LLM_PROVIDER: LLM provider (openai, anthropic, minimax, etc.)
     - TRUN_LLM_MODEL: Model name (default: gpt-4)
-    - OPENAI_API_KEY / ANTHROPIC_API_KEY: API keys
+    - OPENAI_API_KEY / ANTHROPIC_API_KEY / MINIMAX_API_KEY: API keys
+
+    Supported providers:
+    - openai: gpt-4, gpt-4-turbo, gpt-3.5-turbo
+    - anthropic: claude-3-opus, claude-3-sonnet, claude-3-haiku
+    - minimax: abab6.5s-chat, abab6-chat, abab5.5-chat
     """
 
     def __init__(
@@ -59,6 +64,7 @@ class ServiceLLM:
         env_var_mapping = {
             "openai": "OPENAI_API_KEY",
             "anthropic": "ANTHROPIC_API_KEY",
+            "minimax": "MINIMAX_API_KEY",
         }
         env_var = env_var_mapping.get(self.provider, f"{self.provider.upper()}_API_KEY")
         key = os.getenv(env_var)
@@ -67,6 +73,10 @@ class ServiceLLM:
             raise ValueError(f"API key not found. Set {env_var} environment variable.")
 
         return key
+
+    def _get_minimax_group_id(self) -> str | None:
+        """Get Minimax group ID from environment."""
+        return os.getenv("MINIMAX_GROUP_ID")
 
     async def chat(
         self,
@@ -98,6 +108,10 @@ class ServiceLLM:
             model = self.model
         elif self.provider == "anthropic":
             model = f"anthropic/{self.model}"
+        elif self.provider == "minimax":
+            # Minimax uses format: minimax/<model>
+            # Common models: abab5.5-chat, abab6-chat, abab6.5s-chat
+            model = f"minimax/{self.model}"
         else:
             model = f"{self.provider}/{self.model}"
 

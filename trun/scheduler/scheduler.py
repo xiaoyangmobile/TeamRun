@@ -165,6 +165,9 @@ class Scheduler:
 
         try:
             while not self._should_stop:
+                # Reload TODO to get latest state (may have been modified by jumps)
+                todo = self.state_manager.load_main_todo() or todo
+
                 # Get next step
                 next_step = todo.get_next_step()
 
@@ -177,14 +180,16 @@ class Scheduler:
                     break
 
                 # Execute step
-                result = await self._execute_step(todo, next_step)
+                should_continue, jump_to = await self._execute_step(todo, next_step)
 
-                if not result:
+                if not should_continue:
                     # Step failed or user quit
                     break
 
-                # Reload TODO in case it was modified
-                todo = self.state_manager.load_main_todo() or todo
+                # If there's a jump, the target step has been reset to PENDING
+                # The next iteration will pick it up via get_next_step()
+                if jump_to:
+                    self.logger.info(f"Jump triggered, will execute {jump_to} next")
 
         except Exception as e:
             self.logger.error(f"Workflow execution failed: {str(e)}")
@@ -195,18 +200,22 @@ class Scheduler:
             self._running = False
             self.state_manager.save_todo(todo)
 
-    async def _execute_step(self, todo: TodoFile, step: Step) -> bool:
+    async def _execute_step(self, todo: TodoFile, step: Step) -> tuple[bool, str | None]:
         """
         Execute a single step.
 
         :param todo: Parent TodoFile
         :param step: Step to execute
-        :return: True if should continue, False to stop
+        :return: Tuple of (should_continue, jump_to_step_id)
+                 - should_continue: True if should continue workflow
+                 - jump_to_step_id: If set, jump to this step (reset it to PENDING)
         """
         self.logger.step(step.id, "starting", f"Executing {step.type.value}: {step.description}")
         self.state_manager.update_step_status(todo, step.id, StepStatus.RUNNING)
 
         try:
+            jump_to: str | None = None
+
             if step.type == StepType.TASK:
                 success = await self._execute_task(step)
             elif step.type == StepType.DISCUSS:
@@ -215,13 +224,30 @@ class Scheduler:
                 success = await self._execute_parallel(todo, step)
             elif step.type == StepType.GATE:
                 success = await self._execute_gate(todo, step)
+                # Handle gate jump logic
+                if success and step.pass_step:
+                    # Condition passed, continue normally (pass_step is next)
+                    pass
+                elif not success and step.reject_step:
+                    # Condition failed, jump to reject_step
+                    jump_to = step.reject_step
+                    success = True  # Gate itself succeeded, just taking reject path
+                    self.logger.info(f"Gate {step.id} failed, jumping to {step.reject_step}")
             elif step.type == StepType.HUMAN:
                 result = await self._execute_human(todo, step)
                 if result == "quit":
-                    return False
+                    return (False, None)
                 success = result == "pass"
+                # Handle human review jump logic
+                if not success and step.reject_step:
+                    jump_to = step.reject_step
+                    success = True  # Human step itself succeeded
+                    self.logger.info(f"Human review rejected, jumping to {step.reject_step}")
             elif step.type == StepType.GOTO:
-                # GOTO doesn't really "execute", just marks as done
+                # GOTO: jump to target step
+                if step.target_step:
+                    jump_to = step.target_step
+                    self.logger.info(f"GOTO: jumping to {step.target_step}")
                 success = True
             else:
                 self.logger.error(f"Unknown step type: {step.type}")
@@ -230,17 +256,52 @@ class Scheduler:
             if success:
                 self.state_manager.update_step_status(todo, step.id, StepStatus.DONE)
                 self.logger.step(step.id, "completed", f"Step completed")
+
+                # Handle jump: reset target step and its dependents
+                if jump_to:
+                    self._reset_step_for_retry(todo, jump_to)
+
             else:
                 self.state_manager.update_step_status(todo, step.id, StepStatus.FAILED)
                 self.logger.step(step.id, "failed", f"Step failed")
-                return False
+                return (False, None)
 
-            return True
+            return (True, jump_to)
 
         except Exception as e:
             self.state_manager.update_step_status(todo, step.id, StepStatus.FAILED)
             self.logger.error(f"Step {step.id} failed with error: {str(e)}")
-            return False
+            return (False, None)
+
+    def _reset_step_for_retry(self, todo: TodoFile, step_id: str) -> None:
+        """
+        Reset a step and all steps that depend on it for retry.
+
+        :param todo: TodoFile containing the steps
+        :param step_id: Step ID to reset
+        """
+        step = todo.get_step(step_id)
+        if not step:
+            self.logger.warning(f"Cannot reset step {step_id}: not found")
+            return
+
+        # Reset this step
+        self.logger.info(f"Resetting step {step_id} for retry")
+        self.state_manager.update_step_status(todo, step_id, StepStatus.PENDING)
+
+        # Find and reset all steps that depend on this step (transitively)
+        steps_to_check = [step_id]
+        reset_steps = {step_id}
+
+        while steps_to_check:
+            current_id = steps_to_check.pop(0)
+            for s in todo.steps:
+                if current_id in s.depends and s.id not in reset_steps:
+                    reset_steps.add(s.id)
+                    steps_to_check.append(s.id)
+                    if s.status in (StepStatus.DONE, StepStatus.FAILED):
+                        self.logger.info(f"Resetting dependent step {s.id}")
+                        self.state_manager.update_step_status(todo, s.id, StepStatus.PENDING)
 
     async def _execute_task(self, step: Step) -> bool:
         """Execute a TASK step."""
@@ -276,11 +337,198 @@ class Scheduler:
         return True
 
     async def _execute_discussion(self, todo: TodoFile, step: Step) -> bool:
-        """Execute a DISCUSS step."""
-        # TODO: Implement discussion logic
-        # For now, just mark as done
-        self.logger.info(f"Discussion step {step.id} - implementation pending")
+        """
+        Execute a DISCUSS step.
+
+        Multi-role discussion with rounds of turn-taking.
+        Each participant speaks in turn, can see previous messages.
+        Finally extracts a conclusion.
+        """
+        if not step.participants:
+            self.logger.error(f"Discussion step {step.id} has no participants")
+            return False
+
+        self.logger.info(
+            f"Starting discussion: {step.description} "
+            f"with {step.participants}, {step.rounds} round(s)"
+        )
+
+        # Create discussion directory
+        discussion_dir = self.team_run_dir / "discussions" / step.id
+        discussion_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect input context (from previous steps)
+        input_context = ""
+        for input_file in step.inputs:
+            input_path = self.state_manager.get_output_path(input_file)
+            if input_path.exists():
+                input_context += f"\n\n## {input_file}\n\n"
+                input_context += input_path.read_text(encoding="utf-8")
+
+        # Discussion record
+        discussion_record = f"# 讨论记录：{step.description}\n\n"
+        discussion_record += f"参与者：{', '.join(step.participants)}\n"
+        discussion_record += f"轮次：{step.rounds}\n\n"
+
+        if input_context:
+            discussion_record += f"## 讨论背景\n{input_context}\n\n"
+
+        all_messages: list[dict[str, str]] = []
+
+        # Execute rounds
+        for round_num in range(1, step.rounds + 1):
+            discussion_record += f"## 第 {round_num} 轮\n\n"
+
+            for participant in step.participants:
+                role_config = self.config.get_role(participant)
+                if not role_config:
+                    self.logger.warning(f"Role not found: {participant}, skipping")
+                    continue
+
+                # Build context for this participant
+                participant_context = self._build_discussion_context(
+                    step=step,
+                    participant=participant,
+                    role_config=role_config,
+                    round_num=round_num,
+                    total_rounds=step.rounds,
+                    input_context=input_context,
+                    previous_messages=all_messages
+                )
+
+                # Save context file
+                context_file = discussion_dir / f"round{round_num}_{participant}_context.md"
+                context_file.write_text(participant_context, encoding="utf-8")
+
+                # Execute with agent
+                try:
+                    adapter = AdapterFactory.create(role_config.agent)
+                    result = await adapter.execute(str(context_file))
+
+                    if result.success:
+                        message = result.output or "(无回复)"
+                    else:
+                        message = f"(执行失败: {result.error})"
+                        self.logger.warning(f"Participant {participant} failed: {result.error}")
+
+                except Exception as e:
+                    message = f"(执行异常: {str(e)})"
+                    self.logger.error(f"Participant {participant} exception: {str(e)}")
+
+                # Record message
+                all_messages.append({
+                    "round": round_num,
+                    "participant": participant,
+                    "role_name": role_config.name,
+                    "message": message
+                })
+
+                discussion_record += f"### {role_config.name} ({participant})\n\n"
+                discussion_record += f"{message}\n\n"
+
+                # Save individual response
+                response_file = discussion_dir / f"round{round_num}_{participant}_response.md"
+                response_file.write_text(message, encoding="utf-8")
+
+        # Extract conclusion using Service LLM
+        discussion_record += "## 讨论结论\n\n"
+
+        conclusion = await self._extract_discussion_conclusion(step, all_messages)
+        discussion_record += conclusion + "\n"
+
+        # Save discussion record
+        record_file = discussion_dir / "discussion_record.md"
+        record_file.write_text(discussion_record, encoding="utf-8")
+
+        # Save to output if specified
+        if step.output:
+            output_path = self.state_manager.get_output_path(step.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(discussion_record, encoding="utf-8")
+
+        self.logger.info(f"Discussion {step.id} completed")
         return True
+
+    def _build_discussion_context(
+        self,
+        step: Step,
+        participant: str,
+        role_config: Any,
+        round_num: int,
+        total_rounds: int,
+        input_context: str,
+        previous_messages: list[dict]
+    ) -> str:
+        """Build context for a discussion participant."""
+        context = f"# 讨论任务\n\n"
+        context += f"## 你的角色\n\n{role_config.get_prompt(self.team_run_dir)}\n\n"
+        context += f"## 讨论主题\n\n{step.description}\n\n"
+        context += f"## 当前轮次\n\n第 {round_num} 轮，共 {total_rounds} 轮\n\n"
+
+        if input_context:
+            context += f"## 讨论背景材料\n{input_context}\n\n"
+
+        if previous_messages:
+            context += "## 之前的发言\n\n"
+            for msg in previous_messages:
+                context += f"**{msg['role_name']}** (第{msg['round']}轮):\n"
+                context += f"{msg['message']}\n\n"
+
+        context += "## 你的任务\n\n"
+        if round_num == 1:
+            context += "请根据你的角色和专业知识，对讨论主题发表你的看法和建议。\n"
+        else:
+            context += "请根据之前的发言，补充你的观点或回应其他参与者的意见。\n"
+
+        if round_num == total_rounds and participant == step.participants[-1]:
+            context += "\n作为最后一位发言者，请尝试总结讨论要点。\n"
+
+        context += "\n请直接输出你的发言内容，不要输出其他格式。"
+
+        return context
+
+    async def _extract_discussion_conclusion(
+        self,
+        step: Step,
+        messages: list[dict]
+    ) -> str:
+        """Extract conclusion from discussion using Service LLM."""
+        from ..llm.service_llm import ServiceLLM
+
+        llm = ServiceLLM.from_env()
+
+        # Build summary prompt
+        discussion_text = ""
+        for msg in messages:
+            discussion_text += f"**{msg['role_name']}** (第{msg['round']}轮):\n"
+            discussion_text += f"{msg['message']}\n\n"
+
+        prompt = f"""请根据以下讨论记录，提取关键结论和达成的共识。
+
+## 讨论主题
+{step.description}
+
+## 讨论记录
+{discussion_text}
+
+## 要求
+请输出：
+1. 达成的共识
+2. 存在的分歧（如有）
+3. 下一步行动建议
+
+请直接输出结论内容。"""
+
+        try:
+            conclusion = await llm.complete(
+                prompt=prompt,
+                system_prompt="你是一个讨论总结专家，善于提取多人讨论中的关键信息和共识。",
+                temperature=0.5
+            )
+            return conclusion
+        except Exception as e:
+            self.logger.error(f"Failed to extract conclusion: {str(e)}")
+            return "(结论提取失败，请人工总结)"
 
     async def _execute_parallel(self, todo: TodoFile, step: Step) -> bool:
         """Execute a PARALLEL step with Git branch isolation."""
@@ -344,11 +592,115 @@ class Scheduler:
             raise
 
     async def _execute_gate(self, todo: TodoFile, step: Step) -> bool:
-        """Execute a GATE step."""
-        # TODO: Implement condition evaluation using Service LLM
-        # For now, always pass
-        self.logger.info(f"Gate step {step.id} - condition: {step.condition}")
-        return True
+        """
+        Execute a GATE step.
+
+        Evaluates a condition and returns True (pass) or False (reject).
+        The scheduler will handle jumping to pass_step or reject_step.
+
+        Condition format examples:
+        - "review.md:passed" - Check if file contains 'passed' indicator
+        - "tests:all_pass" - Check if tests pass
+        - Custom conditions evaluated by Service LLM
+        """
+        self.logger.info(f"Gate step {step.id} - evaluating condition: {step.condition}")
+
+        if not step.condition:
+            self.logger.warning(f"Gate step {step.id} has no condition, defaulting to pass")
+            return True
+
+        condition = step.condition.strip()
+
+        # Handle file-based conditions (format: "filename:check")
+        if ":" in condition:
+            file_part, check_part = condition.split(":", 1)
+            file_path = self.state_manager.get_output_path(file_part.strip())
+
+            if not file_path.exists():
+                self.logger.warning(f"Gate condition file not found: {file_path}")
+                return False
+
+            file_content = file_path.read_text(encoding="utf-8")
+
+            # Simple keyword checks
+            check_part = check_part.strip().lower()
+            if check_part in ["passed", "pass", "approved", "ok", "success"]:
+                # Check for positive indicators
+                positive_keywords = ["通过", "passed", "approved", "✓", "成功", "ok", "lgtm"]
+                negative_keywords = ["失败", "failed", "rejected", "✗", "不通过", "error"]
+
+                has_positive = any(kw in file_content.lower() for kw in positive_keywords)
+                has_negative = any(kw in file_content.lower() for kw in negative_keywords)
+
+                if has_negative:
+                    self.logger.info(f"Gate {step.id}: Found negative indicator, condition failed")
+                    return False
+                if has_positive:
+                    self.logger.info(f"Gate {step.id}: Found positive indicator, condition passed")
+                    return True
+
+                # If no clear indicator, use LLM to evaluate
+                return await self._evaluate_gate_with_llm(step, file_content)
+
+            elif check_part in ["failed", "fail", "rejected", "error"]:
+                # Inverse check
+                result = not await self._execute_gate(
+                    todo,
+                    Step(
+                        id=step.id,
+                        type=step.type,
+                        condition=f"{file_part}:passed"
+                    )
+                )
+                return result
+
+        # For complex conditions, use LLM evaluation
+        return await self._evaluate_gate_with_llm(step, None)
+
+    async def _evaluate_gate_with_llm(
+        self,
+        step: Step,
+        context_content: str | None
+    ) -> bool:
+        """Use Service LLM to evaluate a gate condition."""
+        from ..llm.service_llm import ServiceLLM
+
+        llm = ServiceLLM.from_env()
+
+        prompt = f"""请评估以下条件是否满足。
+
+## 条件
+{step.condition}
+
+## 步骤描述
+{step.description or "无"}
+
+"""
+        if context_content:
+            prompt += f"""## 相关内容
+{context_content[:3000]}  # Limit content length
+
+"""
+
+        prompt += """## 要求
+请判断条件是否满足，只回答 "是" 或 "否"。"""
+
+        try:
+            response = await llm.complete(
+                prompt=prompt,
+                system_prompt="你是一个条件评估专家，根据给定的条件和上下文，判断条件是否满足。只回答'是'或'否'。",
+                temperature=0.1
+            )
+
+            response = response.strip().lower()
+            passed = response in ["是", "yes", "true", "通过", "满足", "passed"]
+
+            self.logger.info(f"Gate {step.id} LLM evaluation: {response} -> {'passed' if passed else 'failed'}")
+            return passed
+
+        except Exception as e:
+            self.logger.error(f"Gate LLM evaluation failed: {str(e)}")
+            return False
 
     async def _execute_human(self, todo: TodoFile, step: Step) -> str:
         """
