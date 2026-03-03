@@ -9,11 +9,13 @@ from typing import Any, Callable
 
 from ..adapters.base import AgentResult
 from ..adapters.factory import AdapterFactory
-from ..config import ConfigManager, TeamConfig
+from ..config import ConfigManager, ReplanPolicy, TeamConfig
 from ..todo.generator import TodoGenerator
-from ..todo.models import Step, StepStatus, StepType, TodoFile
+from ..todo.models import Step, StepStatus, StepType, TodoFile, ValidationResult
 from ..tools.git_ops import GitOpsTool
 from ..utils.logger import get_logger
+from ..validators.factory import StepValidator, ValidatorFactory
+from .replan import ReplanEngine
 from .state_manager import StateManager
 
 
@@ -74,6 +76,33 @@ class HumanInteractionHandler:
             else:
                 print("无效选项，请重新输入")
 
+    async def confirm_replan(
+        self,
+        step: Step,
+        error: str
+    ) -> bool:
+        """
+        Ask user to confirm replan.
+
+        :param step: The failed step
+        :param error: Error message
+        :return: True if user confirms
+        """
+        print(f"\n[TeamRun] 步骤 {step.id} 执行失败")
+        print(f"[TeamRun] 原因: {error[:200]}")
+        print("\n是否进行重规划？")
+        print("  [y] 是，重新规划")
+        print("  [n] 否，停止执行")
+
+        while True:
+            choice = input("\n> ").strip().lower()
+            if choice in ['y', 'yes', '是']:
+                return True
+            elif choice in ['n', 'no', '否']:
+                return False
+            else:
+                print("请输入 y 或 n")
+
 
 class Scheduler:
     """
@@ -85,6 +114,8 @@ class Scheduler:
     - Parallel execution
     - Gate conditions
     - Human interaction
+    - Output validation (NEW)
+    - Controlled replan on failure (NEW)
     """
 
     def __init__(
@@ -108,6 +139,19 @@ class Scheduler:
 
         self.human_handler = HumanInteractionHandler()
         self.human_handler.auto_approve = auto_approve
+
+        # NEW: Initialize validator
+        self.step_validator = StepValidator(working_dir=str(self.team_run_dir / "outputs"))
+
+        # NEW: Initialize replan engine
+        available_roles = {
+            role_id: role.description
+            for role_id, role in config.roles.items()
+        }
+        self.replan_engine = ReplanEngine(
+            config=config.replan,
+            available_roles=available_roles
+        )
 
         self._running = False
         self._should_stop = False
@@ -202,7 +246,7 @@ class Scheduler:
 
     async def _execute_step(self, todo: TodoFile, step: Step) -> tuple[bool, str | None]:
         """
-        Execute a single step.
+        Execute a single step with validation and replan support.
 
         :param todo: Parent TodoFile
         :param step: Step to execute
@@ -215,34 +259,50 @@ class Scheduler:
 
         try:
             jump_to: str | None = None
+            success = False
+            error_message = ""
 
             if step.type == StepType.TASK:
-                success = await self._execute_task(step)
+                success, error_message = await self._execute_task_with_validation(step)
             elif step.type == StepType.DISCUSS:
                 success = await self._execute_discussion(todo, step)
+                if not success:
+                    error_message = "Discussion failed"
             elif step.type == StepType.PARALLEL:
                 success = await self._execute_parallel(todo, step)
+                if not success:
+                    error_message = "Parallel execution failed"
             elif step.type == StepType.GATE:
-                success = await self._execute_gate(todo, step)
-                # Handle gate jump logic
-                if success and step.pass_step:
-                    # Condition passed, continue normally (pass_step is next)
-                    pass
-                elif not success and step.reject_step:
-                    # Condition failed, jump to reject_step
-                    jump_to = step.reject_step
-                    success = True  # Gate itself succeeded, just taking reject path
-                    self.logger.info(f"Gate {step.id} failed, jumping to {step.reject_step}")
+                gate_passed = await self._execute_gate(todo, step)
+                if gate_passed:
+                    success = True
+                    if step.pass_step:
+                        jump_to = step.pass_step
+                        self.logger.info(f"Gate {step.id} passed, jumping to {step.pass_step}")
+                else:
+                    if step.reject_step:
+                        jump_to = step.reject_step
+                        success = True  # Gate itself succeeded, just taking reject path
+                        self.logger.info(f"Gate {step.id} failed, jumping to {step.reject_step}")
+                    else:
+                        success = False
+                        error_message = "Gate condition failed"
             elif step.type == StepType.HUMAN:
                 result = await self._execute_human(todo, step)
                 if result == "quit":
                     return (False, None)
-                success = result == "pass"
-                # Handle human review jump logic
-                if not success and step.reject_step:
-                    jump_to = step.reject_step
-                    success = True  # Human step itself succeeded
-                    self.logger.info(f"Human review rejected, jumping to {step.reject_step}")
+                if result == "pass":
+                    success = True
+                    if step.pass_step:
+                        jump_to = step.pass_step
+                        self.logger.info(f"Human review passed, jumping to {step.pass_step}")
+                else:
+                    success = False
+                    error_message = "Human review rejected"
+                    if step.reject_step:
+                        jump_to = step.reject_step
+                        success = True  # Human step itself succeeded
+                        self.logger.info(f"Human review rejected, jumping to {step.reject_step}")
             elif step.type == StepType.GOTO:
                 # GOTO: jump to target step
                 if step.target_step:
@@ -252,6 +312,7 @@ class Scheduler:
             else:
                 self.logger.error(f"Unknown step type: {step.type}")
                 success = False
+                error_message = f"Unknown step type: {step.type}"
 
             if success:
                 self.state_manager.update_step_status(todo, step.id, StepStatus.DONE)
@@ -261,17 +322,141 @@ class Scheduler:
                 if jump_to:
                     self._reset_step_for_retry(todo, jump_to)
 
+                return (True, jump_to)
             else:
-                self.state_manager.update_step_status(todo, step.id, StepStatus.FAILED)
-                self.logger.step(step.id, "failed", f"Step failed")
-                return (False, None)
-
-            return (True, jump_to)
+                # Step failed - try replan
+                return await self._handle_step_failure(todo, step, error_message)
 
         except Exception as e:
+            error_message = str(e)
+            self.logger.error(f"Step {step.id} failed with error: {error_message}")
+            return await self._handle_step_failure(todo, step, error_message)
+
+    async def _handle_step_failure(
+        self,
+        todo: TodoFile,
+        step: Step,
+        error: str
+    ) -> tuple[bool, str | None]:
+        """
+        Handle a step failure with potential replan.
+
+        :param todo: TodoFile containing the failed step
+        :param step: The failed step
+        :param error: Error message
+        :return: Tuple of (should_continue, jump_to)
+        """
+        self.logger.step(step.id, "failed", f"Step failed: {error}")
+
+        # Check if we can replan
+        can_replan, reason = self.replan_engine.can_replan(step)
+
+        if not can_replan:
+            self.logger.info(f"Cannot replan: {reason}")
             self.state_manager.update_step_status(todo, step.id, StepStatus.FAILED)
-            self.logger.error(f"Step {step.id} failed with error: {str(e)}")
             return (False, None)
+
+        # Get confirmation if needed
+        confirm_callback = None
+        if self.config.replan.policy == ReplanPolicy.CONFIRM:
+            confirm_callback = self.human_handler.confirm_replan
+
+        # Try to replan
+        should_continue, new_steps = await self.replan_engine.handle_failure(
+            todo=todo,
+            failed_step=step,
+            error=error,
+            confirm_callback=confirm_callback
+        )
+
+        if should_continue and new_steps:
+            # Replan succeeded - save the updated TODO
+            self.state_manager.save_todo(todo)
+            self.logger.info(
+                f"Replan applied: {step.id} replaced with {[s.id for s in new_steps]}"
+            )
+            # Continue execution - the new steps are now in the TODO
+            return (True, None)
+        else:
+            # Replan failed or was rejected
+            self.state_manager.update_step_status(todo, step.id, StepStatus.FAILED)
+            return (False, None)
+
+    async def _execute_task_with_validation(self, step: Step) -> tuple[bool, str]:
+        """
+        Execute a TASK step with output validation.
+
+        :param step: The task step
+        :return: Tuple of (success, error_message)
+        """
+        # First, execute the task
+        if not step.role:
+            return (False, f"Task step {step.id} has no role assigned")
+
+        role_config = self.config.get_role(step.role)
+        if not role_config:
+            return (False, f"Role not found: {step.role}")
+
+        # Create context file
+        context_path = self.state_manager.create_context_file(
+            step,
+            role_config.get_prompt(self.team_run_dir)
+        )
+
+        # Get adapter
+        try:
+            adapter = AdapterFactory.create(role_config.agent)
+        except ValueError as e:
+            return (False, str(e))
+
+        # Execute
+        result = await adapter.execute(str(context_path))
+
+        if not result.success:
+            return (False, f"Agent execution failed: {result.error}")
+
+        # Run validators
+        validation_errors = []
+
+        # 1. Default output file validation (if output is specified)
+        if step.output:
+            output_path = self.state_manager.get_output_path(step.output)
+
+            # Check file exists
+            if self.config.validators.auto_file_check:
+                if not output_path.exists():
+                    validation_errors.append(f"Output file not found: {output_path}")
+
+            # Check completion marker
+            if self.config.validators.auto_completion_marker:
+                if not self.state_manager.check_output_completed(output_path):
+                    validation_errors.append(f"Completion marker not found in: {output_path}")
+
+        # 2. Run custom validators defined on the step
+        if step.validators:
+            context = {
+                "working_dir": str(self.team_run_dir / "outputs"),
+                "step_id": step.id,
+                "step_output": step.output
+            }
+
+            all_passed, results = await self.step_validator.validate_step(
+                validators=step.validators,
+                context=context
+            )
+
+            if not all_passed:
+                for vr in results:
+                    if not vr.success:
+                        validation_errors.append(f"[{vr.validator_type.value}] {vr.message}")
+
+        # Check validation results
+        if validation_errors:
+            error_msg = "Validation failed:\n" + "\n".join(f"  - {e}" for e in validation_errors)
+            self.logger.warning(error_msg)
+            return (False, error_msg)
+
+        return (True, "")
 
     def _reset_step_for_retry(self, todo: TodoFile, step_id: str) -> None:
         """
@@ -302,39 +487,6 @@ class Scheduler:
                     if s.status in (StepStatus.DONE, StepStatus.FAILED):
                         self.logger.info(f"Resetting dependent step {s.id}")
                         self.state_manager.update_step_status(todo, s.id, StepStatus.PENDING)
-
-    async def _execute_task(self, step: Step) -> bool:
-        """Execute a TASK step."""
-        if not step.role:
-            self.logger.error(f"Task step {step.id} has no role assigned")
-            return False
-
-        role_config = self.config.get_role(step.role)
-        if not role_config:
-            self.logger.error(f"Role not found: {step.role}")
-            return False
-
-        # Create context file
-        context_path = self.state_manager.create_context_file(
-            step,
-            role_config.get_prompt(self.team_run_dir)
-        )
-
-        # Get adapter
-        try:
-            adapter = AdapterFactory.create(role_config.agent)
-        except ValueError as e:
-            self.logger.error(str(e))
-            return False
-
-        # Execute
-        result = await adapter.execute(str(context_path))
-
-        if not result.success:
-            self.logger.error(f"Agent execution failed: {result.error}")
-            return False
-
-        return True
 
     async def _execute_discussion(self, todo: TodoFile, step: Step) -> bool:
         """
@@ -542,28 +694,42 @@ class Scheduler:
             # Create branches for each subtask
             for subtask in step.subtasks:
                 branch_name = f"trun/{step.id}/{subtask.id}"
-                self.git.create_branch(branch_name, original_branch)
+                create_result = self.git.create_branch(
+                    branch_name,
+                    original_branch,
+                    checkout=False
+                )
+                if not create_result["success"]:
+                    self.logger.error(f"Failed to create branch {branch_name}: {create_result['stderr']}")
+                    return False
                 branches.append((subtask, branch_name))
 
-            # Execute subtasks in parallel
-            tasks = []
-            for subtask, branch in branches:
-                self.git.switch_branch(branch)
-                tasks.append(self._execute_task(subtask))
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Switch back to original branch
-            self.git.switch_branch(original_branch)
-
-            # Check results and merge
+            # Execute subtasks in isolated branches.
+            # NOTE: this is branch-isolated execution, not concurrent worktree execution.
             all_success = True
-            for (subtask, branch), result in zip(branches, results):
-                if isinstance(result, Exception):
-                    self.logger.error(f"Subtask {subtask.id} failed: {str(result)}")
+            for subtask, branch in branches:
+                switch_result = self.git.switch_branch(branch)
+                if not switch_result["success"]:
+                    self.logger.error(f"Failed to switch to branch {branch}: {switch_result['stderr']}")
                     all_success = False
-                elif not result:
+                    continue
+
+                self.state_manager.update_step_status(todo, subtask.id, StepStatus.RUNNING)
+                try:
+                    success, error = await self._execute_task_with_validation(subtask)
+                    result = success
+                except Exception as e:
+                    self.logger.error(f"Subtask {subtask.id} failed: {str(e)}")
+                    result = False
+
+                if result:
+                    self.state_manager.update_step_status(todo, subtask.id, StepStatus.DONE)
+                else:
+                    self.state_manager.update_step_status(todo, subtask.id, StepStatus.FAILED)
                     all_success = False
+
+                if original_branch:
+                    self.git.switch_branch(original_branch)
 
             if not all_success:
                 return False

@@ -4,10 +4,61 @@ Configuration management for TeamRun.
 
 import json
 import os
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+# ============== Replan Configuration ==============
+
+class ReplanPolicy(str, Enum):
+    """Policy for handling step failures."""
+
+    DISABLED = "disabled"   # No replan, fail immediately
+    AUTO = "auto"           # Automatically replan (local)
+    CONFIRM = "confirm"     # Ask for confirmation before replan
+
+
+class ReplanConfig(BaseModel):
+    """Configuration for replan behavior."""
+
+    policy: ReplanPolicy = Field(
+        default=ReplanPolicy.AUTO,
+        description="Replan policy: disabled, auto, or confirm"
+    )
+    max_attempts: int = Field(
+        default=3,
+        description="Maximum replan attempts per step"
+    )
+    scope: str = Field(
+        default="local",
+        description="Replan scope: 'local' (single step + dependents) or 'global' (full replan)"
+    )
+
+
+# ============== Validator Configuration ==============
+
+class DefaultValidatorConfig(BaseModel):
+    """Default validator settings."""
+
+    auto_file_check: bool = Field(
+        default=True,
+        description="Automatically check output file existence"
+    )
+    auto_completion_marker: bool = Field(
+        default=True,
+        description="Check for <!-- TASK_COMPLETED --> marker"
+    )
+    test_command: str = Field(
+        default="pytest",
+        description="Default test command"
+    )
+    test_timeout: int = Field(
+        default=300,
+        description="Test timeout in seconds"
+    )
 
 
 class RoleConfig(BaseModel):
@@ -67,6 +118,10 @@ class TeamConfig(BaseModel):
 
     roles: dict[str, RoleConfig] = Field(default_factory=dict, description="Role configurations")
     service_llm: ServiceLLMConfig = Field(default_factory=ServiceLLMConfig, description="Service LLM config")
+
+    # NEW: Replan and validator configs
+    replan: ReplanConfig = Field(default_factory=ReplanConfig, description="Replan configuration")
+    validators: DefaultValidatorConfig = Field(default_factory=DefaultValidatorConfig, description="Default validator config")
 
     @classmethod
     def load(cls, config_path: Path | str) -> "TeamConfig":

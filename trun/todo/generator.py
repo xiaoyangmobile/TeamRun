@@ -8,7 +8,7 @@ from typing import Any
 from ..config import RoleConfig, TeamConfig
 from ..llm.service_llm import ServiceLLM
 from ..utils.logger import get_logger
-from .models import Step, StepStatus, StepType, TodoFile, TodoMeta
+from .models import Step, StepStatus, StepType, TodoFile, TodoMeta, ValidatorConfig, ValidatorType
 from .parser import TodoWriter
 
 
@@ -104,6 +104,41 @@ class TodoGenerator:
 3. 合理安排人工审核节点
 4. 使用并行执行提高效率
 5. 只使用提供的角色配置中的角色
+6. 为关键步骤添加验证器（validators），例如：
+   - file_exists: 验证输出文件存在
+   - test_pass: 运行测试验证
+   - schema: 验证输出格式
+"""
+
+    REPLAN_SYSTEM_PROMPT = """你是一个工作流修复专家。当步骤执行失败时，你需要分析原因并生成替代方案。
+
+## 要求
+1. 分析失败原因
+2. 生成最小化的替代步骤（1-3个）
+3. 确保新步骤能解决原问题
+4. 保持与原工作流的兼容性
+
+## 输出格式
+```json
+{
+  "analysis": "失败原因分析",
+  "strategy": "修复策略",
+  "steps": [
+    {
+      "id": "step_id.1",
+      "type": "task",
+      "role": "角色ID",
+      "description": "步骤描述",
+      "instruction": "详细指令",
+      "output": "输出文件",
+      "depends": [],
+      "validators": [
+        {"type": "file_exists", "target": "output.md"}
+      ]
+    }
+  ]
+}
+```
 """
 
     def __init__(self, config: TeamConfig, service_llm: ServiceLLM | None = None):
@@ -212,6 +247,11 @@ class TodoGenerator:
         """Parse step data into Step object."""
         step_type = StepType(data.get("type", "task"))
 
+        # Parse validators if present
+        validators = []
+        if "validators" in data:
+            validators = self._parse_validators(data["validators"])
+
         step = Step(
             id=data.get("id", ""),
             type=step_type,
@@ -228,6 +268,7 @@ class TodoGenerator:
             depends=data.get("depends", []),
             inputs=data.get("inputs", []),
             output=data.get("output"),
+            validators=validators,
         )
 
         # Parse subtasks for parallel
@@ -237,3 +278,129 @@ class TodoGenerator:
             ]
 
         return step
+
+    # ============== Replan Support ==============
+
+    async def replan_step(
+        self,
+        todo: TodoFile,
+        failed_step: Step,
+        error: str,
+        context: dict[str, Any] | None = None
+    ) -> list[Step] | None:
+        """
+        Generate replacement steps for a failed step.
+
+        :param todo: TodoFile containing the failed step
+        :param failed_step: The step that failed
+        :param error: Error message
+        :param context: Additional context
+        :return: List of new steps, or None if replan failed
+        """
+        self.logger.info(f"Generating replan for step {failed_step.id}")
+
+        # Build context
+        completed_info = self._format_completed_steps(todo)
+        roles_info = self._format_roles_info()
+
+        prompt = f"""请为失败的步骤生成替代方案：
+
+## 失败步骤信息
+- ID: {failed_step.id}
+- 类型: {failed_step.type.value}
+- 描述: {failed_step.description}
+- 角色: {failed_step.role or "N/A"}
+- 指令: {failed_step.instruction or "N/A"}
+
+## 失败原因
+{error}
+
+## 已完成的步骤
+{completed_info}
+
+{roles_info}
+
+请生成替代步骤。"""
+
+        try:
+            response = await self.service_llm.complete(
+                prompt=prompt,
+                system_prompt=self.REPLAN_SYSTEM_PROMPT,
+                temperature=0.5
+            )
+
+            new_steps = self._parse_replan_response(response, failed_step)
+            if new_steps:
+                self.logger.info(f"Generated {len(new_steps)} replacement steps")
+            return new_steps
+
+        except Exception as e:
+            self.logger.error(f"Replan generation failed: {str(e)}")
+            return None
+
+    def _format_completed_steps(self, todo: TodoFile) -> str:
+        """Format completed steps for context."""
+        completed = todo.get_completed_steps()
+        if not completed:
+            return "（无已完成步骤）"
+
+        lines = []
+        for step in completed[:10]:  # Limit to last 10
+            lines.append(f"- {step.id}: {step.description}")
+        return "\n".join(lines)
+
+    def _parse_replan_response(
+        self,
+        response: str,
+        original_step: Step
+    ) -> list[Step] | None:
+        """Parse replan response into Step objects."""
+        import json
+        import re
+
+        # Extract JSON
+        json_match = re.search(r'\{[\s\S]*\}', response)
+        if not json_match:
+            return None
+
+        try:
+            data = json.loads(json_match.group())
+        except json.JSONDecodeError:
+            return None
+
+        steps_data = data.get("steps", [])
+        if not steps_data:
+            return None
+
+        new_steps = []
+        for i, step_data in enumerate(steps_data):
+            step_id = step_data.get("id", f"{original_step.id}.{i + 1}")
+
+            step = self._parse_step(step_data)
+            step.id = step_id
+            step.replan_count = original_step.replan_count + 1
+            step.metadata = {
+                "replanned_from": original_step.id,
+                "replan_reason": data.get("analysis", ""),
+                "replan_strategy": data.get("strategy", "")
+            }
+
+            new_steps.append(step)
+
+        return new_steps
+
+    def _parse_validators(self, validators_data: list[dict]) -> list[ValidatorConfig]:
+        """Parse validators configuration from JSON."""
+        validators = []
+        for v in validators_data:
+            try:
+                validator_type = ValidatorType(v.get("type", "file_exists"))
+                validators.append(ValidatorConfig(
+                    type=validator_type,
+                    target=v.get("target", ""),
+                    options=v.get("options", {}),
+                    required=v.get("required", True)
+                ))
+            except ValueError:
+                pass  # Skip invalid validator types
+        return validators

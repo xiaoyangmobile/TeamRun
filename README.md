@@ -12,6 +12,8 @@ Multi-Agent collaboration framework for local development.
 - **File-Based State Management**: All state and context stored as files for transparency
 - **Git Branch Isolation**: Parallel tasks run in isolated branches with automatic merge
 - **Human Review Points**: Built-in support for human approval and feedback
+- **Output Validation**: Configurable validators (file existence, tests, schema, LLM semantic check)
+- **Controlled Replan**: Automatic local replan on step failure with traceable history
 
 ## Installation
 
@@ -110,9 +112,28 @@ trun resume
       "agent": "claude-code",
       "prompt": "你是项目经理，负责..."
     }
+  },
+  "replan": {
+    "policy": "auto",
+    "max_attempts": 3,
+    "scope": "local"
+  },
+  "validators": {
+    "auto_file_check": true,
+    "auto_completion_marker": true,
+    "test_command": "pytest",
+    "test_timeout": 300
   }
 }
 ```
+
+### Replan Policy
+
+| Policy | Description |
+|--------|-------------|
+| `disabled` | No replan, fail immediately on error |
+| `auto` | Automatically replan failed steps (local scope) |
+| `confirm` | Ask for user confirmation before replan |
 
 > Note: Service LLM configuration is managed via environment variables (`TRUN_LLM_PROVIDER`, `TRUN_LLM_MODEL`), not in this config file.
 
@@ -146,7 +167,20 @@ trun resume
 
 - [ ] #step3 @task(architect) 设计架构
   - depends: step2
+  - output: design.md
+  - validators:
+    - file_exists:design.md
+    - llm:架构设计需要包含数据模型和API设计
 ```
+
+### Validators
+
+| Type | Syntax | Description |
+|------|--------|-------------|
+| File Check | `file_exists:path` | Verify output file exists |
+| Test | `test_pass:test_path` | Run tests and verify pass |
+| Schema | `schema:schema.json` | Validate against JSON schema |
+| LLM | `llm:requirement` | LLM semantic validation |
 
 ## Development
 
@@ -202,7 +236,15 @@ TeamRun/
 │   │   └── generator.py        # LLM-based generator
 │   ├── scheduler/              # Workflow execution
 │   │   ├── scheduler.py        # Main scheduler
-│   │   └── state_manager.py    # State management
+│   │   ├── state_manager.py    # State management
+│   │   └── replan.py           # Replan engine
+│   ├── validators/             # Output validation
+│   │   ├── base.py             # Base validator class
+│   │   ├── factory.py          # Validator factory
+│   │   ├── file_validator.py   # File existence validator
+│   │   ├── test_validator.py   # Test pass validator
+│   │   ├── schema_validator.py # JSON schema validator
+│   │   └── llm_validator.py    # LLM semantic validator
 │   ├── adapters/               # Agent adapters
 │   │   ├── base.py             # Base adapter class
 │   │   ├── claude_code.py      # Claude Code adapter

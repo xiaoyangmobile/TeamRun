@@ -823,3 +823,197 @@ TeamRun/
 ## 待讨论问题
 
 （暂无）
+
+## 架构增强：验证器与受控重规划
+
+### 设计目标
+
+**主模式**：LLM 规划 + 确定性调度
+**增强点**：受控动态重规划（局部） + 强验证器（产物/测试/状态）
+
+### 架构流程图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         用户任务                                 │
+└─────────────────────────────┬───────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    TodoGenerator (LLM)                          │
+│              初始规划 + 验证器配置                               │
+└─────────────────────────────┬───────────────────────────────────┘
+                              ▼
+                    ┌─────────────────┐
+                    │   main.todo.md  │  ← 可审计的执行计划
+                    └────────┬────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        Scheduler                                │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │                    执行循环                              │    │
+│  │   get_next_step() → execute() → validate() → update()  │    │
+│  └───────────────────────────┬────────────────────────────┘    │
+│                              │                                  │
+│              ┌───────────────┼───────────────┐                 │
+│              ▼               ▼               ▼                 │
+│      ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
+│      │  成功 ✓     │ │  失败 ✗     │ │  需审核     │          │
+│      │  → 验证     │ │  → 重规划?  │ │  → @human   │          │
+│      └──────┬──────┘ └──────┬──────┘ └─────────────┘          │
+│             │               │                                   │
+│      ┌──────▼──────┐ ┌──────▼────────┐                         │
+│      │ StepValidator│ │ ReplanEngine  │                         │
+│      │ - file_exists│ │ - 局部重规划  │                         │
+│      │ - test_pass  │ │ - 可追溯     │                         │
+│      │ - schema     │ │ - 有限次     │                         │
+│      │ - llm        │ │ - 可确认     │                         │
+│      └──────┬──────┘ └──────┬────────┘                         │
+│             │               │                                   │
+│             └───────┬───────┘                                   │
+│                     ▼                                           │
+│            ┌────────────────┐                                   │
+│            │  更新 TODO.md  │ ← 记录 [REPLANNED]               │
+│            └────────────────┘                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 验证器框架
+
+#### 验证器类型
+
+| 类型 | 说明 | 使用场景 |
+|------|------|----------|
+| `file_exists` | 验证输出文件存在且非空 | 所有产出文件 |
+| `test_pass` | 运行测试命令验证通过 | 代码开发步骤 |
+| `schema` | 验证输出符合 JSON Schema | API 设计、配置文件 |
+| `llm` | LLM 语义验证 | 文档质量、需求满足度 |
+| `custom` | 自定义命令验证 | 特殊场景 |
+
+#### 配置示例
+
+```json
+{
+  "validators": {
+    "auto_file_check": true,
+    "auto_completion_marker": true,
+    "test_command": "pytest",
+    "test_timeout": 300
+  }
+}
+```
+
+#### TODO 文件语法
+
+```markdown
+- [ ] #step3 @task(backend) 实现用户认证 API
+  - output: auth_api.py
+  - validators:
+    - file_exists:auth_api.py
+    - test_pass:tests/test_auth.py
+    - schema:openapi/auth.yaml
+```
+
+### 重规划引擎
+
+#### 设计原则
+
+| 原则 | 说明 |
+|------|------|
+| **局部性** | 只改写失败步骤及其直接后续，不推翻已完成步骤 |
+| **可追溯** | 所有重规划记录在 TODO 文件历史中 |
+| **有限次** | 同一步骤最多重规划 N 次，防止死循环 |
+| **可确认** | 支持人工确认模式，重规划前询问用户 |
+
+#### 重规划策略
+
+```python
+class ReplanPolicy(Enum):
+    DISABLED = "disabled"   # 禁用重规划
+    AUTO = "auto"           # 自动重规划（默认）
+    CONFIRM = "confirm"     # 需要人工确认
+```
+
+#### 配置示例
+
+```json
+{
+  "replan": {
+    "policy": "auto",
+    "max_attempts": 3,
+    "scope": "local"
+  }
+}
+```
+
+#### 重规划流程
+
+```
+步骤执行失败
+     ↓
+检查是否可重规划
+  - policy != disabled?
+  - replan_count < max_attempts?
+  - step_type in [TASK, DISCUSS, PARALLEL]?
+     ↓
+[policy == CONFIRM] → 询问用户确认
+     ↓
+调用 LLM 生成替代步骤
+     ↓
+替换失败步骤及其依赖
+     ↓
+记录重规划历史
+     ↓
+继续执行
+```
+
+#### TODO 文件重规划历史
+
+```markdown
+## 重规划历史
+- [2024-01-15 10:30:00] step2: 执行失败，缺少数据库配置
+  - 新步骤: step2.1, step2.2
+
+## 流程
+
+- [x] #step1 @task(backend) 设计数据模型
+- [!] #step2 @task(backend) 实现 API  <!-- FAILED -->
+- [ ] #step2.1 @task(backend) 配置数据库连接
+  <!-- [REPLANNED] from step2 -->
+- [ ] #step2.2 @task(backend) 实现 API
+  - depends: step1, step2.1
+  <!-- [REPLANNED] from step2 -->
+```
+
+### 模块结构
+
+```
+trun/
+├── validators/                 # 验证器框架
+│   ├── __init__.py
+│   ├── base.py                 # Validator 基类
+│   ├── factory.py              # ValidatorFactory, StepValidator
+│   ├── file_validator.py       # FileExistsValidator
+│   ├── test_validator.py       # TestPassValidator
+│   ├── schema_validator.py     # SchemaValidator
+│   └── llm_validator.py        # LLMValidator
+├── scheduler/
+│   ├── scheduler.py            # 集成验证和重规划
+│   ├── replan.py               # ReplanEngine
+│   └── state_manager.py
+├── todo/
+│   ├── models.py               # ValidatorConfig, ReplanRecord
+│   ├── parser.py               # 解析 validators 和重规划历史
+│   └── generator.py            # 支持重规划生成
+└── config.py                   # ReplanConfig, DefaultValidatorConfig
+```
+
+### 优势总结
+
+| 考虑因素 | 当前设计 | 完全自主 Agent |
+|----------|----------|----------------|
+| **可预测性** | ⭐⭐⭐⭐⭐ 高 | ⭐⭐ 低 |
+| **可审计性** | ⭐⭐⭐⭐⭐ TODO.md 可读 | ⭐⭐ 依赖日志 |
+| **成本控制** | ⭐⭐⭐⭐ LLM 只用于规划 | ⭐⭐ 每步都调用 |
+| **断点续做** | ⭐⭐⭐⭐⭐ 原生支持 | ⭐⭐⭐ 需要额外实现 |
+| **动态适应** | ⭐⭐⭐⭐ 受控重规划 | ⭐⭐⭐⭐⭐ 灵活 |
+| **调试难度** | ⭐⭐⭐⭐ 易调试 | ⭐⭐ 难调试 |

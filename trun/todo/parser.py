@@ -9,7 +9,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import Step, StepStatus, StepType, TodoFile, TodoMeta
+from .models import (
+    ReplanRecord,
+    Step,
+    StepStatus,
+    StepType,
+    TodoFile,
+    TodoMeta,
+    ValidatorConfig,
+    ValidatorType,
+)
 
 
 class TodoParser:
@@ -17,10 +26,10 @@ class TodoParser:
 
     # Regex patterns
     STEP_PATTERN = re.compile(
-        r'^- \[([ x~!\-])\]\s+'      # Checkbox
-        r'(?:#(\w+(?:\.\w+)?)\s+)?'  # Optional step ID
-        r'@(\w+)(?:\(([^)]*)\))?\s*' # Step type with optional args
-        r'(.*)$',                     # Description
+        r'^(\s*)- \[([ x~!\-])\]\s+'  # Indent + checkbox
+        r'(?:#([\w.]+)\s+)?'          # Optional step ID
+        r'@(\w+)(?:\(([^)]*)\))?\s*'  # Step type with optional args
+        r'(.*)$',                      # Description
         re.MULTILINE
     )
 
@@ -63,10 +72,14 @@ class TodoParser:
         # Parse steps
         steps = self._parse_steps(content)
 
+        # Parse replan history
+        replan_history = self._parse_replan_history(content)
+
         return TodoFile(
             file_path=file_path,
             meta=meta,
-            steps=steps
+            steps=steps,
+            replan_history=replan_history
         )
 
     def _parse_title(self, lines: list[str]) -> str:
@@ -128,14 +141,15 @@ class TodoParser:
         steps = []
         lines = content.split('\n')
 
-        current_step = None
         step_counter = 0
+        step_stack: list[tuple[int, Step]] = []
 
         for i, line in enumerate(lines):
             # Check for step line
             match = self.STEP_PATTERN.match(line)
             if match:
-                checkbox, step_id, step_type, args, description = match.groups()
+                indent_str, checkbox, step_id, step_type, args, description = match.groups()
+                indent = len(indent_str)
 
                 # Generate step ID if not provided
                 step_counter += 1
@@ -157,10 +171,18 @@ class TodoParser:
                 self._parse_step_args(step, step_type, args)
 
                 # Parse properties from following lines
-                self._parse_step_properties(step, lines, i + 1)
+                self._parse_step_properties(step, lines, i + 1, current_indent=indent)
 
-                steps.append(step)
-                current_step = step
+                # Build hierarchy by indentation
+                while step_stack and indent <= step_stack[-1][0]:
+                    step_stack.pop()
+
+                if step_stack:
+                    step_stack[-1][1].subtasks.append(step)
+                else:
+                    steps.append(step)
+
+                step_stack.append((indent, step))
 
         return steps
 
@@ -200,17 +222,31 @@ class TodoParser:
             # @goto(step_id)
             step.target_step = args
 
-    def _parse_step_properties(self, step: Step, lines: list[str], start_idx: int) -> None:
+    def _parse_step_properties(
+        self,
+        step: Step,
+        lines: list[str],
+        start_idx: int,
+        current_indent: int
+    ) -> None:
         """Parse step properties from indented lines."""
         for i in range(start_idx, len(lines)):
             line = lines[i]
+            stripped = line.strip()
 
-            # Stop at non-indented line or empty line
-            if not line.startswith('  ') or not line.strip():
+            # Stop at next sibling/parent step or section boundary
+            if not stripped:
+                break
+            line_indent = len(line) - len(line.lstrip(' '))
+            if line_indent <= current_indent:
                 break
 
+            # Skip nested step lines; they are parsed by _parse_steps
+            if re.match(r'^\s*-\s*\[[ x~!\-]\]\s+', line):
+                continue
+
             # Parse property
-            match = re.match(r'^\s+- (\w+):\s*(.+)$', line)
+            match = re.match(r'^\s+- (\w+):\s*(.*)$', line)
             if match:
                 key, value = match.groups()
                 key = key.lower()
@@ -230,6 +266,110 @@ class TodoParser:
                     step.pass_step = value.lstrip('#')
                 elif key == 'reject':
                     step.reject_step = value.lstrip('#')
+                elif key == 'validators':
+                    step.validators = self._parse_validators(value, lines, i + 1, line_indent)
+                elif key == 'replan_count':
+                    step.replan_count = int(value)
+
+    def _parse_validators(
+        self,
+        first_value: str,
+        lines: list[str],
+        start_idx: int,
+        base_indent: int
+    ) -> list[ValidatorConfig]:
+        """Parse validators configuration."""
+        validators = []
+
+        # Check if validators are inline or multi-line
+        if first_value and not first_value.startswith('['):
+            # Single inline validator: validators: file_exists:output.md
+            validators.append(self._parse_single_validator(first_value))
+        else:
+            # Multi-line validators - look for indented lines
+            for i in range(start_idx, len(lines)):
+                line = lines[i]
+                if not line.strip():
+                    continue
+
+                line_indent = len(line) - len(line.lstrip(' '))
+                if line_indent <= base_indent:
+                    break
+
+                stripped = line.strip()
+                if stripped.startswith('- '):
+                    validator_str = stripped[2:].strip()
+                    validator = self._parse_single_validator(validator_str)
+                    if validator:
+                        validators.append(validator)
+
+        return validators
+
+    def _parse_single_validator(self, value: str) -> ValidatorConfig | None:
+        """Parse a single validator string like 'file_exists:output.md' or 'test_pass:tests/'."""
+        if ':' not in value:
+            return None
+
+        parts = value.split(':', 1)
+        type_str = parts[0].strip().lower()
+        target = parts[1].strip()
+
+        # Map type string to ValidatorType
+        type_mapping = {
+            'file_exists': ValidatorType.FILE_EXISTS,
+            'file': ValidatorType.FILE_EXISTS,
+            'test_pass': ValidatorType.TEST_PASS,
+            'test': ValidatorType.TEST_PASS,
+            'schema': ValidatorType.SCHEMA,
+            'llm': ValidatorType.LLM,
+            'custom': ValidatorType.CUSTOM,
+        }
+
+        validator_type = type_mapping.get(type_str)
+        if not validator_type:
+            return None
+
+        return ValidatorConfig(
+            type=validator_type,
+            target=target
+        )
+
+    def _parse_replan_history(self, content: str) -> list[ReplanRecord]:
+        """Parse replan history from content."""
+        history = []
+
+        # Find 重规划历史 section
+        section_match = re.search(
+            r'## 重规划历史\s*\n((?:- .+\n?)+)',
+            content
+        )
+
+        if not section_match:
+            return history
+
+        section_content = section_match.group(1)
+
+        # Parse each record: - [YYYY-MM-DD HH:MM:SS] step_id: reason
+        pattern = r'- \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(\S+):\s*(.+?)(?=\n|$)'
+
+        for match in re.finditer(pattern, section_content):
+            timestamp_str = match.group(1)
+            step_id = match.group(2)
+            reason = match.group(3)
+
+            try:
+                timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                history.append(ReplanRecord(
+                    timestamp=timestamp,
+                    original_step_id=step_id,
+                    reason=reason.strip(),
+                    new_steps=[],
+                    context="Parsed from TODO file"
+                ))
+            except ValueError:
+                pass
+
+        return history
 
 
 class TodoWriter:
@@ -273,6 +413,16 @@ class TodoWriter:
             lines.append(f"- 总轮次：{todo.meta.total_rounds}")
         lines.append("")
 
+        # Replan history (if any)
+        if todo.replan_history:
+            lines.append("## 重规划历史")
+            for record in todo.replan_history:
+                timestamp_str = record.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                lines.append(f"- [{timestamp_str}] {record.original_step_id}: {record.reason}")
+                if record.new_steps:
+                    lines.append(f"  - 新步骤: {', '.join(record.new_steps)}")
+            lines.append("")
+
         # Steps
         lines.append("## 流程")
         lines.append("")
@@ -311,6 +461,20 @@ class TodoWriter:
             lines.append(f"{prop_indent}- pass: #{step.pass_step}")
         if step.reject_step:
             lines.append(f"{prop_indent}- reject: #{step.reject_step}")
+
+        # Validators - NEW
+        if step.validators:
+            lines.append(f"{prop_indent}- validators:")
+            for validator in step.validators:
+                lines.append(f"{prop_indent}  - {validator.type.value}:{validator.target}")
+
+        # Replan info - NEW
+        if step.replan_count > 0:
+            lines.append(f"{prop_indent}- replan_count: {step.replan_count}")
+
+        # Metadata for replanned steps
+        if step.metadata.get("replanned_from"):
+            lines.append(f"{prop_indent}<!-- [REPLANNED] from {step.metadata['replanned_from']} -->")
 
         # Subtasks for parallel
         if step.subtasks:

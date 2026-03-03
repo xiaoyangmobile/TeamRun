@@ -64,17 +64,27 @@ class GitOpsTool:
             return result["stdout"].strip()
         return None
 
-    def create_branch(self, branch_name: str, from_branch: str | None = None) -> dict[str, Any]:
+    def create_branch(
+        self,
+        branch_name: str,
+        from_branch: str | None = None,
+        checkout: bool = True
+    ) -> dict[str, Any]:
         """
         Create a new branch.
 
         :param branch_name: New branch name
         :param from_branch: Base branch (uses current if None)
+        :param checkout: Whether to checkout the new branch immediately
         :return: Operation result
         """
-        if from_branch:
+        if checkout and from_branch:
             return self._run_git(["checkout", "-b", branch_name, from_branch])
-        return self._run_git(["checkout", "-b", branch_name])
+        if checkout:
+            return self._run_git(["checkout", "-b", branch_name])
+        if from_branch:
+            return self._run_git(["branch", branch_name, from_branch])
+        return self._run_git(["branch", branch_name])
 
     def switch_branch(self, branch_name: str) -> dict[str, Any]:
         """

@@ -10,6 +10,8 @@
 - **文件即状态**：所有状态和上下文以文件形式存储，透明可追溯
 - **Git 分支隔离**：并行任务在独立分支中执行，自动合并
 - **人工审核节点**：内置人工审批和反馈机制
+- **输出验证**：可配置的验证器（文件存在、测试通过、Schema 校验、LLM 语义检查）
+- **受控重规划**：步骤失败时自动进行局部重规划，可追溯历史
 
 ## 安装
 
@@ -108,9 +110,28 @@ trun resume
       "agent": "claude-code",
       "prompt": "你是项目经理，负责..."
     }
+  },
+  "replan": {
+    "policy": "auto",
+    "max_attempts": 3,
+    "scope": "local"
+  },
+  "validators": {
+    "auto_file_check": true,
+    "auto_completion_marker": true,
+    "test_command": "pytest",
+    "test_timeout": 300
   }
 }
 ```
+
+### 重规划策略
+
+| 策略 | 说明 |
+|------|------|
+| `disabled` | 禁用重规划，失败后立即中止 |
+| `auto` | 自动重规划失败的步骤（局部范围） |
+| `confirm` | 重规划前询问用户确认 |
 
 > 注意：Service LLM 配置通过环境变量管理（`TRUN_LLM_PROVIDER`、`TRUN_LLM_MODEL`），不在此配置文件中。
 
@@ -144,7 +165,20 @@ trun resume
 
 - [ ] #step3 @task(architect) 设计架构
   - depends: step2
+  - output: design.md
+  - validators:
+    - file_exists:design.md
+    - llm:架构设计需要包含数据模型和API设计
 ```
+
+### 验证器
+
+| 类型 | 语法 | 说明 |
+|------|------|------|
+| 文件检查 | `file_exists:path` | 验证输出文件存在 |
+| 测试 | `test_pass:test_path` | 运行测试并验证通过 |
+| Schema | `schema:schema.json` | 验证符合 JSON Schema |
+| LLM | `llm:requirement` | LLM 语义验证 |
 
 ### 状态标记
 
@@ -210,7 +244,15 @@ TeamRun/
 │   │   └── generator.py        # LLM 生成器
 │   ├── scheduler/              # 工作流执行
 │   │   ├── scheduler.py        # 调度器
-│   │   └── state_manager.py    # 状态管理
+│   │   ├── state_manager.py    # 状态管理
+│   │   └── replan.py           # 重规划引擎
+│   ├── validators/             # 输出验证
+│   │   ├── base.py             # 验证器基类
+│   │   ├── factory.py          # 验证器工厂
+│   │   ├── file_validator.py   # 文件存在验证器
+│   │   ├── test_validator.py   # 测试通过验证器
+│   │   ├── schema_validator.py # JSON Schema 验证器
+│   │   └── llm_validator.py    # LLM 语义验证器
 │   ├── adapters/               # Agent 适配器
 │   │   ├── base.py             # 适配器基类
 │   │   ├── claude_code.py      # Claude Code 适配器

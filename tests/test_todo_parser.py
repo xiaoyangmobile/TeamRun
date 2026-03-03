@@ -93,6 +93,37 @@ class TestTodoParser:
         assert step3 is not None
         assert step3.status == StepStatus.DONE
 
+    def test_parse_parallel_subtasks(self):
+        """Test parsing subtasks under a PARALLEL step."""
+        parser = TodoParser()
+        todo = parser.parse_content(SAMPLE_TODO)
+
+        step5 = todo.get_step("step5")
+        assert step5 is not None
+        assert step5.type == StepType.PARALLEL
+        assert len(step5.subtasks) == 0
+
+        parallel_todo = """# 任务：并行测试
+
+## 元信息
+- 创建时间：2024-01-15 10:00:00
+- 状态：RUNNING
+
+## 流程
+
+- [ ] #step1 @parallel 并行开发
+  - subtasks:
+    - [ ] #step1.1 @task(backend) 开发后端
+    - [ ] #step1.2 @task(frontend) 开发前端
+"""
+        parsed = parser.parse_content(parallel_todo)
+        step1 = parsed.get_step("step1")
+        assert step1 is not None
+        assert step1.type == StepType.PARALLEL
+        assert len(step1.subtasks) == 2
+        assert step1.subtasks[0].id == "step1.1"
+        assert step1.subtasks[1].id == "step1.2"
+
     def test_get_next_step(self):
         """Test getting next executable step."""
         parser = TodoParser()
