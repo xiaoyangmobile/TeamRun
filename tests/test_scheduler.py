@@ -46,7 +46,7 @@ async def test_execute_task_requires_output_marker(tmp_path, monkeypatch):
         output="result.md",
     )
 
-    success = await scheduler._execute_task(step)
+    success, _ = await scheduler._execute_task_with_validation(step)
     assert success is False
 
 
@@ -68,7 +68,7 @@ async def test_execute_task_accepts_output_with_marker(tmp_path, monkeypatch):
         output="result.md",
     )
 
-    success = await scheduler._execute_task(step)
+    success, _ = await scheduler._execute_task_with_validation(step)
     assert success is True
 
 
@@ -187,11 +187,11 @@ async def test_parallel_runs_each_subtask_on_its_branch(tmp_path, monkeypatch):
 
     executed_on: list[str] = []
 
-    async def _fake_execute_task(step):
+    async def _fake_execute_task_with_validation(step):
         executed_on.append(fake_git.current)
-        return True
+        return (True, "")
 
-    monkeypatch.setattr(scheduler, "_execute_task", _fake_execute_task)
+    monkeypatch.setattr(scheduler, "_execute_task_with_validation", _fake_execute_task_with_validation)
 
     sub1 = Step(id="step1.1", type=StepType.TASK, role="backend", description="a")
     sub2 = Step(id="step1.2", type=StepType.TASK, role="backend", description="b")
@@ -210,4 +210,3 @@ async def test_parallel_runs_each_subtask_on_its_branch(tmp_path, monkeypatch):
         "trun/step1/step1.1",
         "trun/step1/step1.2",
     ]
-

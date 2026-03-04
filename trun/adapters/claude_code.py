@@ -3,6 +3,7 @@ Claude Code adapter using Claude Agent SDK.
 """
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from ..utils.logger import get_logger
@@ -75,19 +76,17 @@ class ClaudeCodeAdapter(AgentAdapter):
             session_id = None
             output_files: list[str] = []
 
-            # Track file changes via hook
-            async def log_file_change(input_data: dict, tool_use_id: str, ctx: Any) -> dict:
-                file_path = input_data.get("tool_input", {}).get("file_path")
-                if file_path:
-                    output_files.append(file_path)
-                    self.logger.debug(f"File modified: {file_path}")
-                return {}
+            # Build options
+            options_kwargs = {
+                "allowed_tools": self.allowed_tools,
+                "permission_mode": self.permission_mode,
+            }
 
-            options = ClaudeAgentOptions(
-                allowed_tools=self.allowed_tools,
-                permission_mode=self.permission_mode,
-                working_directory=working_dir,
-            )
+            # Set working directory if provided (use 'cwd' parameter)
+            if working_dir:
+                options_kwargs["cwd"] = Path(working_dir)
+
+            options = ClaudeAgentOptions(**options_kwargs)
 
             prompt = f"请阅读以下任务上下文并执行任务：\n\n{context}"
 

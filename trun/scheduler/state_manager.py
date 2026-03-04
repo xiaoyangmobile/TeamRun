@@ -64,7 +64,14 @@ class StateManager:
         :param todo: TodoFile to save
         :param path: Optional path (uses todo.file_path if not provided)
         """
-        save_path = path or Path(todo.file_path) or self.main_todo_path
+        if path is not None:
+            save_path = path
+        elif todo.file_path and todo.file_path.strip():
+            save_path = Path(todo.file_path)
+        else:
+            save_path = self.main_todo_path
+
+        todo.file_path = str(save_path)
         self.writer.write_file(todo, save_path)
         self.logger.debug(f"Saved TODO to: {save_path}")
 
