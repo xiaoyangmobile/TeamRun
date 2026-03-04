@@ -107,8 +107,7 @@ trun resume
     "pm": {
       "name": "项目经理",
       "description": "负责项目规划和管理",
-      "agent": "claude-code",
-      "prompt": "你是项目经理，负责..."
+      "agent": "claude-code"
     }
   },
   "replan": {

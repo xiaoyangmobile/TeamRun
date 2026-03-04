@@ -40,41 +40,41 @@
     "pm": {
       "name": "项目经理",
       "description": "项目管理者，规划项目功能和架构",
-      "agent": "claude-code",
-      "prompt": "你是项目经理，负责..."
+      "agent": "claude-code"
     },
     "architect": {
       "name": "开发架构师",
       "description": "开发主负责人，负责代码架构设计和代码review",
-      "agent": "claude-code",
-      "prompt": "你是架构师，负责..."
+      "agent": "claude-code"
     },
     "backend": {
       "name": "后端工程师",
       "description": "后端开发人员，负责后端代码编写",
-      "agent": "codex",
-      "prompt": "你是后端工程师，负责..."
+      "agent": "codex"
     },
     "frontend": {
       "name": "前端工程师",
       "description": "前端开发人员，负责前端代码编写",
-      "agent": "codex",
-      "prompt": "你是前端工程师，负责..."
+      "agent": "codex"
     },
     "tester": {
       "name": "测试工程师",
       "description": "测试人员，负责做最后的代码测试",
-      "agent": "claude-code",
-      "prompt": "你是测试工程师，负责..."
+      "agent": "claude-code"
     }
   },
-  "service_llm": {
-    "provider": "openai",
-    "model": "gpt-4",
-    "api_key_env": "OPENAI_API_KEY"
+  "replan": {
+    "policy": "auto",
+    "max_attempts": 3
+  },
+  "validators": {
+    "auto_file_check": true,
+    "auto_completion_marker": true
   }
 }
 ```
+
+> 注意：Service LLM 配置通过环境变量管理（`TRUN_LLM_PROVIDER`、`TRUN_LLM_MODEL`、`OPENAI_API_KEY` 等）。
 
 ## TODO 文件语法设计
 

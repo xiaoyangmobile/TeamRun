@@ -61,7 +61,7 @@ def role():
 
 @role.command("add")
 @click.argument("role_id", required=False)
-@click.option("--agent", type=click.Choice(["claude-code", "codex"]), help="Agent type")
+@click.option("--agent", type=click.Choice(["claude-code", "codex", "mock"]), help="Agent type")
 @click.option("--quick", is_flag=True, help="Quick create with minimal info")
 def role_add(role_id: str | None, agent: str | None, quick: bool):
     """Add a new role (interactive)."""
@@ -73,8 +73,7 @@ def role_add(role_id: str | None, agent: str | None, quick: bool):
         role = RoleConfig(
             name=role_id,
             description=f"Role: {role_id}",
-            agent=agent,
-            prompt=None
+            agent=agent
         )
         config.add_role(role_id, role)
         config_manager.save_config(config)
@@ -99,36 +98,14 @@ def role_add(role_id: str | None, agent: str | None, quick: bool):
     if not agent:
         agent = Prompt.ask(
             "Agent type",
-            choices=["claude-code", "codex"],
+            choices=["claude-code", "codex", "mock"],
             default="claude-code"
         )
-
-    prompt_file = Prompt.ask(
-        "Prompt file path (optional, leave empty to skip)",
-        default=""
-    )
-
-    prompt = None
-    if not prompt_file:
-        if Confirm.ask("Enter prompt inline?", default=False):
-            console.print("Enter prompt (Ctrl+D or empty line to finish):")
-            lines = []
-            try:
-                while True:
-                    line = input()
-                    if not line:
-                        break
-                    lines.append(line)
-            except EOFError:
-                pass
-            prompt = "\n".join(lines)
 
     role = RoleConfig(
         name=name,
         description=description,
-        agent=agent,
-        prompt=prompt or None,
-        prompt_file=prompt_file or None
+        agent=agent
     )
 
     config.add_role(role_id, role)

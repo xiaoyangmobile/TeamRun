@@ -400,7 +400,7 @@ class Scheduler:
         # Create context file
         context_path = self.state_manager.create_context_file(
             step,
-            role_config.get_prompt(self.team_run_dir)
+            role_config.description
         )
 
         # Get adapter
@@ -613,7 +613,7 @@ class Scheduler:
     ) -> str:
         """Build context for a discussion participant."""
         context = f"# 讨论任务\n\n"
-        context += f"## 你的角色\n\n{role_config.get_prompt(self.team_run_dir)}\n\n"
+        context += f"## 你的角色\n\n{role_config.name}: {role_config.description}\n\n"
         context += f"## 讨论主题\n\n{step.description}\n\n"
         context += f"## 当前轮次\n\n第 {round_num} 轮，共 {total_rounds} 轮\n\n"
 

@@ -7,6 +7,7 @@ from typing import Type
 from .base import AgentAdapter
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
+from .mock import MockAdapter
 
 
 class AdapterFactory:
@@ -15,6 +16,7 @@ class AdapterFactory:
     _adapters: dict[str, Type[AgentAdapter]] = {
         "claude-code": ClaudeCodeAdapter,
         "codex": CodexAdapter,
+        "mock": MockAdapter,
     }
 
     @classmethod

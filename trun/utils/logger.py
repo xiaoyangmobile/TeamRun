@@ -42,10 +42,10 @@ class TeamRunLogger:
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
-        # Console handler (only warnings and above by default)
+        # Console handler (INFO and above by default, configurable via TRUN_LOG_LEVEL)
         console_handler = logging.StreamHandler()
-        console_level = os.getenv("TRUN_LOG_LEVEL", "WARNING")
-        console_handler.setLevel(getattr(logging, console_level.upper(), logging.WARNING))
+        console_level = os.getenv("TRUN_LOG_LEVEL", "INFO")
+        console_handler.setLevel(getattr(logging, console_level.upper(), logging.INFO))
         console_formatter = logging.Formatter(
             "%(levelname)s: %(message)s"
         )

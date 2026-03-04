@@ -76,12 +76,15 @@ class CodexAdapter(AgentAdapter):
         :param working_dir: Working directory for the agent
         :return: AgentResult with execution results
         """
+        # Check SDK availability first
         try:
             from codex_local_sdk import CodexExecRequest, SandboxMode
         except ImportError:
+            self.logger.error("codex-local-sdk-python is not installed")
             return AgentResult(
                 success=False,
-                error="codex-local-sdk-python is not installed. Install with: pip install codex-local-sdk-python"
+                error="codex-local-sdk-python is not installed. Install with: pip install codex-local-sdk-python. "
+                      "Alternatively, change the agent type to 'mock' in your role configuration for testing."
             )
 
         self._running = True
