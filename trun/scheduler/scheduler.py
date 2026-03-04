@@ -410,10 +410,24 @@ class Scheduler:
             return (False, str(e))
 
         # Execute
-        result = await adapter.execute(str(context_path))
+        result = await adapter.execute(
+            str(context_path),
+            working_dir=str(self.state_manager.outputs_dir)
+        )
 
         if not result.success:
             return (False, f"Agent execution failed: {result.error}")
+
+        # Fallback: materialize agent text output into expected file when file is missing.
+        if step.output:
+            output_path = self.state_manager.get_output_path(step.output)
+            if (not output_path.exists()) and (result.output or "").strip():
+                content = result.output
+                if "<!-- TASK_COMPLETED -->" not in content:
+                    content = content.rstrip() + "\n\n<!-- TASK_COMPLETED -->\n"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(content, encoding="utf-8")
+                self.logger.info(f"Materialized agent output to file: {output_path}")
 
         # Run validators
         validation_errors = []

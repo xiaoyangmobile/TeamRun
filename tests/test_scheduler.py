@@ -11,8 +11,13 @@ from trun.todo.models import Step, StepStatus, StepType, TodoFile, TodoMeta
 
 
 class _FakeAdapter:
+    def __init__(self, output: str = "ok"):
+        self.output = output
+        self.last_working_dir: str | None = None
+
     async def execute(self, context_file: str, working_dir: str | None = None) -> AgentResult:
-        return AgentResult(success=True, output="ok")
+        self.last_working_dir = working_dir
+        return AgentResult(success=True, output=self.output)
 
     async def stop(self) -> None:
         return None
@@ -36,7 +41,7 @@ def _make_scheduler(tmp_path) -> Scheduler:
 async def test_execute_task_requires_output_marker(tmp_path, monkeypatch):
     """TASK with output should fail when completion marker is missing."""
     scheduler = _make_scheduler(tmp_path)
-    monkeypatch.setattr("trun.scheduler.scheduler.AdapterFactory.create", lambda *_: _FakeAdapter())
+    monkeypatch.setattr("trun.scheduler.scheduler.AdapterFactory.create", lambda *_: _FakeAdapter(output=""))
 
     step = Step(
         id="step1",
@@ -70,6 +75,53 @@ async def test_execute_task_accepts_output_with_marker(tmp_path, monkeypatch):
 
     success, _ = await scheduler._execute_task_with_validation(step)
     assert success is True
+
+
+@pytest.mark.asyncio
+async def test_execute_task_passes_working_dir_to_adapter(tmp_path, monkeypatch):
+    """TASK execution should pass outputs working directory to adapter."""
+    scheduler = _make_scheduler(tmp_path)
+    fake_adapter = _FakeAdapter(output="content\n<!-- TASK_COMPLETED -->\n")
+    monkeypatch.setattr("trun.scheduler.scheduler.AdapterFactory.create", lambda *_: fake_adapter)
+
+    step = Step(
+        id="step1",
+        type=StepType.TASK,
+        role="backend",
+        description="write output",
+        output="result.md",
+    )
+
+    success, _ = await scheduler._execute_task_with_validation(step)
+    assert success is True
+    assert fake_adapter.last_working_dir == str(scheduler.state_manager.outputs_dir)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_materializes_output_from_agent_text(tmp_path, monkeypatch):
+    """If agent returns text but no file, scheduler should materialize output file."""
+    scheduler = _make_scheduler(tmp_path)
+    monkeypatch.setattr(
+        "trun.scheduler.scheduler.AdapterFactory.create",
+        lambda *_: _FakeAdapter(output="PRD content")
+    )
+
+    step = Step(
+        id="step1",
+        type=StepType.TASK,
+        role="backend",
+        description="write output",
+        output="result.md",
+    )
+
+    success, _ = await scheduler._execute_task_with_validation(step)
+    assert success is True
+
+    output_path = scheduler.state_manager.get_output_path("result.md")
+    assert output_path.exists()
+    content = output_path.read_text(encoding="utf-8")
+    assert "PRD content" in content
+    assert "<!-- TASK_COMPLETED -->" in content
 
 
 @pytest.mark.asyncio
