@@ -31,13 +31,27 @@ pip install .
 
 ### 1. 初始化项目
 
-在你的项目目录中：
-
 ```bash
+# 在当前目录初始化新项目（自动生成项目名）
 trun init
+
+# 在当前目录初始化新项目（指定项目名）
+trun init my-project
+
+# 在指定目录初始化项目
+trun init my-project -w ~/projects/my-app
+
+# 带描述初始化
+trun init my-project -w ~/projects/my-app -d "我的应用"
+
+# 仅初始化全局配置（不创建项目）
+trun init --global
 ```
 
-这将创建 `.team_run/` 目录及配置文件。
+这将：
+- 在 `~/.team_run/projects.json` 中注册项目
+- 在项目路径下创建 `.team_run/` 目录
+- 在 `.team_run/project.json` 中保存项目名称
 
 ### 2. 配置环境变量
 
@@ -57,45 +71,90 @@ TAVILY_API_KEY=your_tavily_key
 ### 3. 添加团队角色
 
 ```bash
-# 交互式添加
+# 在项目目录内，自动识别当前项目
+cd ~/my-project
 trun role add
 
 # 或快速模式
 trun role add pm --agent claude-code --quick
 trun role add architect --agent claude-code --quick
 trun role add backend --agent codex --quick
+
+# 或者从其他目录操作指定项目
+trun role add -p my-project
 ```
 
 ### 4. 启动任务
 
 ```bash
+# 在项目目录内，自动识别当前项目
+cd ~/my-project
 trun start "开发一个博客系统"
+
+# 或者从其他目录操作指定项目
+trun start -p my-project "开发一个博客系统"
 ```
 
 ### 5. 查看状态
 
 ```bash
+# 在项目目录内
 trun status
+
+# 或指定项目
+trun status -p my-project
 ```
 
 ### 6. 恢复中断的任务
 
 ```bash
+# 在项目目录内
 trun resume
+
+# 或指定项目
+trun resume -p my-project
 ```
+
+> **提示**：
+> - 在项目目录内执行命令时，会自动从 `.team_run/project.json` 读取项目名称，无需 `-p` 参数
+> - 使用 `-p <项目名>` 参数可以从任意目录操作已注册的项目
 
 ## CLI 命令
 
+### 项目管理
+
 | 命令 | 说明 |
 |------|------|
-| `trun init` | 初始化 TeamRun 配置 |
-| `trun role add` | 添加角色（交互式） |
-| `trun role list` | 列出所有角色 |
-| `trun role remove <id>` | 删除角色 |
-| `trun start "<任务>"` | 启动新任务 |
-| `trun resume` | 恢复中断的任务 |
-| `trun status` | 查看当前任务状态 |
-| `trun logs` | 查看执行日志 |
+| `trun init` | 在当前目录初始化项目（自动生成项目名） |
+| `trun init <名称>` | 在当前目录初始化项目（指定名称） |
+| `trun init <名称> -w <路径>` | 在指定目录初始化项目 |
+| `trun init --global` | 仅初始化全局配置 |
+| `trun project list` | 列出所有已注册的项目 |
+| `trun project show <名称>` | 查看项目详情 |
+| `trun project remove <名称>` | 从注册表移除项目 |
+
+### 角色管理
+
+| 命令 | 说明 |
+|------|------|
+| `trun role add [-p <项目>]` | 添加角色（交互式） |
+| `trun role list [-p <项目>]` | 列出所有角色 |
+| `trun role remove <id> [-p <项目>]` | 删除角色 |
+
+### 任务执行
+
+| 命令 | 说明 |
+|------|------|
+| `trun start "<任务>" [-p <项目>]` | 启动新任务 |
+| `trun resume [-p <项目>]` | 恢复中断的任务 |
+| `trun status [-p <项目>]` | 查看当前任务状态 |
+| `trun logs [-p <项目>]` | 查看执行日志 |
+
+> **提示**：
+> - 在项目目录内执行命令时，自动从 `.team_run/project.json` 读取项目名
+> - 项目信息存储在：
+>   - `~/.team_run/projects.json` - 全局项目注册表
+>   - `<项目目录>/.team_run/project.json` - 项目名称标识
 
 ## 配置文件
 

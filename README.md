@@ -33,13 +33,27 @@ pip install .
 
 ### 1. Initialize Project
 
-In your project directory:
-
 ```bash
+# Initialize project in current directory (auto-generate project name)
 trun init
+
+# Initialize in current directory with specific name
+trun init my-project
+
+# Initialize in a specific directory
+trun init my-project -w ~/projects/my-app
+
+# Initialize with description
+trun init my-project -w ~/projects/my-app -d "My awesome project"
+
+# Initialize global config only (no project)
+trun init --global
 ```
 
-This creates `.team_run/` directory with configuration files.
+This will:
+- Register the project in `~/.team_run/projects.json`
+- Create `.team_run/` directory in the project path
+- Save project name in `.team_run/project.json`
 
 ### 2. Configure Environment Variables
 
@@ -59,45 +73,90 @@ TAVILY_API_KEY=your_tavily_key
 ### 3. Add Team Roles
 
 ```bash
-# Interactive mode
+# In project directory, auto-detect current project
+cd ~/my-project
 trun role add
 
 # Or quick mode
 trun role add pm --agent claude-code --quick
 trun role add architect --agent claude-code --quick
 trun role add backend --agent codex --quick
+
+# Or operate on specific project from anywhere
+trun role add -p my-project
 ```
 
 ### 4. Start a Task
 
 ```bash
-trun start "开发一个博客系统"
+# In project directory, auto-detect current project
+cd ~/my-project
+trun start "Build a blog system"
+
+# Or operate on specific project from anywhere
+trun start -p my-project "Build a blog system"
 ```
 
 ### 5. Check Status
 
 ```bash
+# In project directory
 trun status
+
+# Or specify project
+trun status -p my-project
 ```
 
 ### 6. Resume Interrupted Task
 
 ```bash
+# In project directory
 trun resume
+
+# Or specify project
+trun resume -p my-project
 ```
+
+> **Note**:
+> - When running commands inside a project directory, the project name is auto-detected from `.team_run/project.json`
+> - Use `-p <project_name>` to operate on any registered project from any directory
 
 ## CLI Commands
 
+### Project Management
+
 | Command | Description |
 |---------|-------------|
-| `trun init` | Initialize TeamRun configuration |
-| `trun role add` | Add a new role (interactive) |
-| `trun role list` | List all configured roles |
-| `trun role remove <id>` | Remove a role |
-| `trun start "<task>"` | Start a new task |
-| `trun resume` | Resume interrupted task |
-| `trun status` | Show current task status |
-| `trun logs` | View execution logs |
+| `trun init` | Initialize project in current directory (auto-generate name) |
+| `trun init <name>` | Initialize project with specific name |
+| `trun init <name> -w <path>` | Initialize project in specific directory |
+| `trun init --global` | Initialize global config only |
+| `trun project list` | List all registered projects |
+| `trun project show <name>` | Show project details |
+| `trun project remove <name>` | Remove project from registry |
+
+### Role Management
+
+| Command | Description |
+|---------|-------------|
+| `trun role add [-p <project>]` | Add a new role (interactive) |
+| `trun role list [-p <project>]` | List all configured roles |
+| `trun role remove <id> [-p <project>]` | Remove a role |
+
+### Task Execution
+
+| Command | Description |
+|---------|-------------|
+| `trun start "<task>" [-p <project>]` | Start a new task |
+| `trun resume [-p <project>]` | Resume interrupted task |
+| `trun status [-p <project>]` | Show current task status |
+| `trun logs [-p <project>]` | View execution logs |
+
+> **Note**:
+> - When inside a project directory, project name is auto-detected from `.team_run/project.json`
+> - Project information is stored in:
+>   - `~/.team_run/projects.json` - Global project registry
+>   - `<project-dir>/.team_run/project.json` - Project name identifier
 
 ## Configuration
 
